@@ -1,11 +1,16 @@
-{-# language GADTs, RankNTypes #-}
+{-# language GADTs, RankNTypes, GeneralizedNewtypeDeriving #-}
 
-import Control.Monad.Free.Church (F (..))
+import Control.Monad.Free.Church (F (..), retract, hoistF)
 import Control.Monad.Freer.Church
 
-import Control.Monad (unless) 
+import Control.Applicative (Alternative (..))
+import Control.Monad (MonadPlus(..), unless, replicateM_)
+import Control.Monad.Trans.State
+import Control.Monad.Trans.Except
+import Control.Monad.Trans.Class (lift)
 
 import Data.Functor.Identity
+import Data.Function (on)
 
 -- | The empty type constructor with no values.
 data Empty a
@@ -64,44 +69,91 @@ instance Functor TeleF where
   fmap f (WriteF c k) = WriteF c (f k)
 
 teleTo :: FFC Teletype a -> F TeleF a
-teleTo (FFC p) = F (\ar telek -> p ar (\tty k -> case tty of
-                                                   ReadTTY -> telek (ReadF k)
-                                                   WriteTTY c -> telek (WriteF c (k ()))))
+teleTo = retractFFC . foist phi
+            -- F (\ar telek -> p ar (\tty k -> case tty of
+            --                                  ReadTTY -> telek (ReadF k)
+            --                                  WriteTTY c -> telek (WriteF c (k ()))))
+  where
+    phi :: Teletype x -> F TeleF x
+    phi ReadTTY = F (\ar telek -> telek (ReadF ar))
+    phi (WriteTTY c) = F (\ar telek -> telek (WriteF c (ar ())))
+
 
 teleFrom :: F TeleF a -> FFC Teletype a
-teleFrom (F q) = FFC (\pur imp -> q pur (\telek -> case telek of
-                                            ReadF k -> imp ReadTTY k
-                                            WriteF c k -> imp (WriteTTY c) (\() -> k)))
+teleFrom = retract . hoistF phi
+              -- FFC (\pur imp -> q pur (\telek -> case telek of
+              --                                    ReadF k -> imp ReadTTY k
+              --                                    WriteF c k -> imp (WriteTTY c) (\() -> k)))
+  where
+    phi :: TeleF x -> FFC Teletype x
+    phi (ReadF k) = fimpure ReadTTY (fpure . k)
+    phi (WriteF c k) = fimpure (WriteTTY c) (\() -> pure k)
+
 
 ttyIO :: FFC Teletype a -> IO a
-ttyIO (FFC p) = p return (\tty k -> case tty of
-                                      ReadTTY -> do
-                                        c <- getChar
-                                        k c
-                                      WriteTTY c -> do
-                                        putChar c
-                                        k ())
+ttyIO = retractFFC . foist phi
+                -- p return (\tty -> case tty of
+                --                      ReadTTY -> \k -> getChar >>= k
+                --                      WriteTTY c -> \k -> putChar c >> k ())
+  where
+    phi :: Teletype x -> IO x
+    phi ReadTTY = getChar
+    phi (WriteTTY c) = putChar c
 
 newtype TapeIn = TapeIn String
   deriving (Show, Eq)
-newtype TapeOut = TapeOut [Char]
-  deriving (Show, Eq)
+newtype TapeOut = TapeOut ShowS
 
-ttyTape :: FFC Teletype a -> TapeIn -> (Maybe (a, TapeOut), TapeIn)
-ttyTape (FFC p) = p pur imp
+mkTapeOut :: String -> TapeOut
+mkTapeOut = TapeOut . showString
+
+playOutTape :: TapeOut -> String
+playOutTape (TapeOut s) = s ""
+
+instance Eq TapeOut where
+  (==) = (==) `on` playOutTape
+
+instance Show TapeOut where
+  showsPrec _ = showString . playOutTape
+
+newtype Tapes a = Tapes { unTapes :: ExceptT () (State (TapeIn, TapeOut)) a }
+  deriving (Functor, Applicative, Alternative, Monad, MonadPlus)
+
+runTapes :: Tapes a -> TapeIn -> (Maybe a, TapeIn, TapeOut)
+runTapes (Tapes m) tapeIn = case runState (runExceptT m) (tapeIn, TapeOut id) of
+                              (Left (), (tapeIn, tapeOut)) -> (Nothing, tapeIn, tapeOut)
+                              (Right a, (tapeIn, tapeOut)) -> (Just a, tapeIn, tapeOut)
+
+getTape :: Tapes Char
+getTape = Tapes $ do
+  (tapeIn, tapeOut) <- lift get
+  case tapeIn of
+    TapeIn [] -> mzero
+    TapeIn (c:cs) -> do
+      lift $ put (TapeIn cs, tapeOut)
+      return c
+
+putTape :: Char -> Tapes ()
+putTape c = Tapes $ lift $ modify (\(tapeIn, TapeOut cs) -> (tapeIn, TapeOut (cs . showChar c)))
+
+
+ttyTape :: FFC Teletype a -> Tapes a
+ttyTape = retractFFC . foist phi -- (FFC p) = p pur imp
   where
-    pur :: a -> TapeIn -> (Maybe (a, TapeOut), TapeIn)
-    pur = \x tape -> (Just (x, TapeOut []), tape)
-    {-# INLINE pur #-}
-    imp :: Teletype x -> (x -> TapeIn -> (Maybe (a, TapeOut), TapeIn)) -> TapeIn -> (Maybe (a, TapeOut), TapeIn)
-    imp = \tty k tape -> case tty of
-                       ReadTTY -> case tape of
-                                    TapeIn [] -> (Nothing, TapeIn [])
-                                    TapeIn (c:cs) -> k c (TapeIn cs)
-                       WriteTTY c -> case k () tape of
-                                       (Nothing, tapeIn) -> (Nothing, tapeIn)
-                                       (Just (ans, TapeOut cs), tapeIn) -> (Just (ans, TapeOut (c:cs)), tapeIn)
-    {-# INLINE imp #-}
+    phi :: Teletype x -> Tapes x
+    phi ReadTTY = getTape
+    phi (WriteTTY c) = putTape c
+  -- where
+  --   pur :: a -> TapeIn -> (Maybe (a, TapeOut), TapeIn)
+  --   pur = \x tape -> (Just (x, TapeOut []), tape)
+  --   imp :: Teletype x -> (x -> TapeIn -> (Maybe (a, TapeOut), TapeIn)) -> TapeIn -> (Maybe (a, TapeOut), TapeIn)
+  --   imp = \tty -> case tty of
+  --                      ReadTTY -> \ k tape -> case tape of
+  --                                   TapeIn [] -> (Nothing, TapeIn [])
+  --                                   TapeIn (c:cs) -> k c (TapeIn cs)
+  --                      WriteTTY c -> \k tape -> case k () tape of
+  --                                      (Nothing, tapeIn) -> (Nothing, tapeIn)
+  --                                      (Just (ans, TapeOut cs), tapeIn) -> (Just (ans, TapeOut (c:cs)), tapeIn)
 {-# INLINE ttyTape #-}
 
 readTTY :: FFC Teletype Char
@@ -111,19 +163,24 @@ writeTTY :: Char -> FFC Teletype ()
 writeTTY = eta . WriteTTY
 
 echo :: Int -> FFC Teletype ()
-echo 0 = return ()
-echo n = do
+echo n = replicateM_ n $ do
   c <- readTTY
   writeTTY c
-  echo (n - 1)
+
   
 echo' :: Int -> FFC Teletype ()
-echo' n = teleFrom (teleTo (echo n))
+echo' = teleFrom . teleTo . echo
 
 assertEq :: (Show a, Eq a) => a -> a -> IO ()
 assertEq got want =
   unless (got == want) $ fail ("Expected: " ++ show want ++ "\nGot: " ++ show got)
 
+echoTape = ttyTape . echo
+echoTape' = ttyTape . echo'
+
 main = do
   assertEq (interpEmpty (f 10)) 89
-  assertEq (ttyTape (echo' 2) (TapeIn "abcd")) (Just ((), TapeOut "ab"), TapeIn "cd")
+  assertEq (runTapes (echoTape 2) (TapeIn "abcd")) (Just (), TapeIn "cd", mkTapeOut "ab")
+  assertEq (runTapes (echoTape' 2) (TapeIn "abcd")) (Just (), TapeIn "cd", mkTapeOut "ab")
+-- ttyIO (echo 10)
+
