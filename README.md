@@ -1,4 +1,4 @@
-= Church-encoded Freer Monad =
+# Church-encoded Freer Monad #
 
 This Oleg's [Freer monad](http://okmij.org/ftp/Computation/free-monad.html) but Church-encoded.
 
