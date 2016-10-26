@@ -7,6 +7,8 @@ module Control.Monad.Freer.Church (
   FFC (..)
   -- * Operations
   , eta
+  , fpure
+  , fimpure
   , foist
   , retractFFC
     -- * Proofs
@@ -28,11 +30,21 @@ newtype FFC g a =
 
 -- | It's a 'Functor' without a constraint on g
 instance Functor (FFC g) where
-  fmap f = \mf -> runFFC mf (\a -> FFC (\pur _imp -> pur (f a)))
-                  (\gx k -> FFC (\pur imp -> imp gx (\x -> runFFC (k x) pur imp)))
+  fmap f = \mf -> FFC (\pur imp -> runFFC mf (pur . f) imp)
   {-# INLINE fmap #-}
 
--- | Embed the effect of 'g' into the monad
+-- | Lift a pure value into the Freer monad
+fpure :: a -> FFC g a
+fpure = \a -> FFC (\pur _imp -> pur a)
+{-# INLINE fpure #-}
+
+-- | Given an operation in @g@ and a continuation returning a monadic
+-- computation, sequence the continuation after the operation.
+fimpure :: g x -> (x -> FFC g a) -> FFC g a
+fimpure gx k = FFC (\pur imp -> imp gx (\x -> runFFC (k x) pur imp))
+{-# INLINE fimpure #-}
+
+-- | Embed an operation of 'g' into the monad
 --
 eta :: g a -> FFC g a
 eta = \eff -> FFC (\pur imp -> imp eff pur)
@@ -40,24 +52,27 @@ eta = \eff -> FFC (\pur imp -> imp eff pur)
 
 -- | It's an 'Applicative' without a constraint on g
 instance Applicative (FFC g) where
-  pure = \a -> FFC (\pur _imp -> pur a)
+  pure = fpure
   {-# INLINE pure #-}
-  (<*>) = \mf mx -> runFFC mf (runFFC mx (\x f -> (pure (f x)))
-                                (\gx k f -> FFC (\pur imp -> imp gx (\x -> runFFC (k x f) pur imp))))
-                    (\gx k -> FFC (\pur imp -> imp gx (\x -> runFFC (k x) pur imp)))
+  (<*>) = \mf mx -> FFC (\pur imp -> runFFC mf (\f -> runFFC mx (pur . f) imp) imp)
+          -- \mf mx -> runFFC mf (runFFC mx (\x f -> (fpure (f x)))
+          --                      (\gx k f -> fimpure gx (\x -> (k x f))))
+          --          fimpure
   {-# INLINE (<*>) #-}
 
 
 -- | And it's a 'Monad' without constraints on 'g'
 instance Monad (FFC g) where
-  return = pure
+  return = fpure
   {-# INLINE return #-}
-  (>>=) = \mx f -> runFFC mx f (\gx k -> FFC (\pur imp -> imp gx (\x -> runFFC (k x) pur imp)))
+  (>>=) = \mx f -> FFC (\pur imp -> runFFC mx (\x -> runFFC (f x) pur imp) imp)
+                   -- runFFC mx f fimpure
   {-# INLINE (>>=) #-}
 
 -- | Lift a natural transformation in Hask to a natural transformation on the free monads.
 foist :: (forall x . f x -> g x) -> FFC f a -> FFC g a
-foist phi = \ma -> runFFC ma return (\fx k -> eta (phi fx) >>= k)
+foist phi = \ma -> -- runFFC ma return (fimpure . phi)
+              FFC (\pur imp -> runFFC ma pur (imp . phi))
 {-# INLINE foist #-}
 
 -- | If @m@ is a monad, we can interpret @FFC m@ in itself
