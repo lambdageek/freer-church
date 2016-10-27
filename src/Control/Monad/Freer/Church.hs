@@ -8,17 +8,24 @@ module Control.Monad.Freer.Church (
   
   -- * Definition
   FFC (..)
+  , FFCT (..)
   -- * Operations
   , eta
+  , eta'
   , fpure
+  , fpure'
   , fimpure
+  , fimpure'
   , foist
+  , foistT
   , retractFFC
+  , retractFFCT
     -- * Proofs
     -- $proofs
   ) where
 
 import Control.Monad.Trans.Cont
+import Control.Monad.Trans.Class
 
 -- $derivation
 --
@@ -59,24 +66,46 @@ import Control.Monad.Trans.Cont
 newtype FFC g a =
   FFC { unFFC :: forall r . (forall x . g x -> Cont r x) -> Cont r a }
 
+-- | Freer monad transformer.
+--
+-- Unfolding the definition of 'ContT' this type is precisely <https://hackage.haskell.org/package/free/docs/Control-Monad-Trans-Free-Church.html#t:FT FT>
+--
+newtype FFCT g m a =
+  FFCT { unFFCT :: forall r . (forall x . g x -> ContT r m x) -> ContT r m a}
+
 runFFC :: FFC g a -> (a -> r) -> (forall x . g x -> (x -> r) -> r) -> r
 runFFC ma pur imp = runCont (unFFC ma (cont . imp)) pur
+
+runFFCT :: Monad m => FFCT g m a -> (a -> m r) -> (forall x . g x -> (x -> m r) -> m r) -> m r
+runFFCT tma mpur mimp = runContT (unFFCT tma (ContT . mimp)) mpur
 
 -- | It's a 'Functor' without a constraint on g
 instance Functor (FFC g) where
   fmap f = \ma -> FFC (\imp -> fmap f (unFFC ma imp))
   {-# INLINE fmap #-}
 
+instance Functor (FFCT g m) where
+  fmap f = \tma -> FFCT (\mimp -> fmap f (unFFCT tma mimp))
+
 -- | Lift a pure value into the Freer monad
 fpure :: a -> FFC g a
 fpure = \a -> FFC (\imp -> pure a)
 {-# INLINE fpure #-}
 
+-- | Lift a pure value into a Freer monad transformer
+fpure' :: a -> FFCT g m a
+fpure' = \a -> FFCT (\mimp -> pure a)
+{-# INLINE fpure' #-}
+
 -- | Given an operation in @g@ and a continuation returning a monadic
 -- computation, sequence the continuation after the operation.
 fimpure :: g x -> (x -> FFC g a) -> FFC g a
-fimpure gx k = FFC (\imp -> (imp gx) >>= \x -> unFFC (k x) imp)
+fimpure = \gx k -> FFC (\imp -> (imp gx) >>= \x -> unFFC (k x) imp)
 {-# INLINE fimpure #-}
+
+-- | Sequence an operation in @g@ to be followed by the continuation.
+fimpure' :: g x -> (x -> FFCT g m a) -> FFCT g m a
+fimpure' = \ gx k -> FFCT (\mimp -> (mimp gx) >>= \x -> unFFCT (k x) mimp)
 
 -- | Embed an operation of 'g' into the monad
 --
@@ -94,6 +123,11 @@ eta = \eff -> FFC (\imp -> imp eff)
 -- === FFC (\pur imp -> imp eff (\x -> unFFC (fpure x) pur imp))                    by defn
 -- === fimpure eff fpure                                                             by defn
 
+-- | Embed an operation of 'g' into the monad transformer
+eta' :: g a -> FFCT g m a
+eta' = \eff -> FFCT (\mimp -> mimp eff)
+{-# INLINE eta' #-}
+
 -- | It's an 'Applicative' without a constraint on g
 instance Applicative (FFC g) where
   pure = fpure
@@ -104,6 +138,10 @@ instance Applicative (FFC g) where
           --          fimpure
   {-# INLINE (<*>) #-}
 
+instance Applicative (FFCT g m) where
+  pure = fpure'
+  (<*>) = \mf mx -> FFCT (\mimp -> unFFCT mf mimp <*> unFFCT mx mimp)
+
 
 -- | And it's a 'Monad' without constraints on 'g'
 instance Monad (FFC g) where
@@ -113,11 +151,22 @@ instance Monad (FFC g) where
                    -- unFFC mx f fimpure
   {-# INLINE (>>=) #-}
 
+instance Monad (FFCT g m) where
+  return = fpure'
+  (>>=) = \mx f -> FFCT (\mimp -> unFFCT mx mimp >>= \x -> unFFCT (f x) mimp)
+
+instance MonadTrans (FFCT g) where
+  lift m = FFCT (\mimp -> lift m)
+
 -- | Lift a natural transformation in Hask to a natural transformation on the free monads.
 foist :: (forall x . f x -> g x) -> FFC f a -> FFC g a
 foist phi = \ma -> -- unFFC ma return (fimpure . phi)
               FFC (\imp -> unFFC ma (imp . phi))
 {-# INLINE foist #-}
+
+-- | Lift a natural transformation in Hask to a natural transformation on the free monads.
+foistT :: (forall x . f x -> g x) -> FFCT f m a -> FFCT g m a
+foistT phi = \ma -> FFCT (\mimp -> unFFCT ma (mimp . phi))
 
 -- | If @m@ is a monad, we can interpret @FFC m@ in itself
 retractFFC :: Monad m => FFC m a -> m a
@@ -163,6 +212,13 @@ retractFFC ma = runCont (unFFC ma (\mx -> cont (\f -> mx >>= f))) return
 -- @
 --
 -- stuck here.
+
+-- | Interpret the freer monad transformer in itself.
+retractFFCT :: (MonadTrans t, Monad (t m), Monad m) => FFCT (t m) m a -> t m a
+retractFFCT ma = join . lift $ runContT (unFFCT ma (\tmx -> ContT (\kmtm -> return $ tmx >>= (join . lift . kmtm)))) (return . return)
+  where
+    join :: Monad m => m (m a) -> m a
+    join mmx = mmx >>= id
 
 -- $proofs
 --
