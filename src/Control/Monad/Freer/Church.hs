@@ -3,6 +3,9 @@
 -- Based on Oleg's Freer Monad <http://okmij.org/ftp/Computation/free-monad.html> but Chruch encoded.
 {-# language GADTs, RankNTypes #-}
 module Control.Monad.Freer.Church (
+  -- * Derivation
+  -- $derivation
+  
   -- * Definition
   FFC (..)
   -- * Operations
@@ -15,6 +18,34 @@ module Control.Monad.Freer.Church (
     -- $proofs
   ) where
 
+import Control.Monad.Trans.Cont
+
+-- $derivation
+--
+-- Start with Oleg's "Freer monad"
+--
+-- @
+-- data Freer g a where
+--   FPure   :: a -> Freer g a
+--   FImpure :: g x -> (x -> Freer g a) -> Freer g a
+-- @
+--
+-- Church encode it to get
+--
+-- @
+-- data FFC g a =
+--   FFC { unFFC :: forall r . (a -> r) -> (forall x . g x -> (x -> r) -> r) -> r }
+-- @
+--
+-- Now flip the two arguments around and note that @'Cont' t b = (b -> t) -> t@
+--
+-- @
+-- data FFC g a =
+--   FFC { unFFC :: forall r . (forall x . g x -> Cont r x) -> Cont r a }
+-- @
+--
+-- So, the Freer monad is just an interpreter for 'g' into the continuation monad.
+
 -- | The Church-encoded Freer 'Monad'.  For any @g@ (even if it isn't a 'Functor'!) @FFC g@ is a monad.
 --
 -- 
@@ -26,22 +57,25 @@ module Control.Monad.Freer.Church (
 --   FImpure :: g x -> (x -> Freer g a) -> Freer g a
 -- @
 newtype FFC g a =
-  FFC { runFFC :: forall r . (a -> r) -> (forall x . g x -> (x -> r) -> r) -> r }
+  FFC { unFFC :: forall r . (forall x . g x -> Cont r x) -> Cont r a }
+
+runFFC :: FFC g a -> (a -> r) -> (forall x . g x -> (x -> r) -> r) -> r
+runFFC ma pur imp = runCont (unFFC ma (cont . imp)) pur
 
 -- | It's a 'Functor' without a constraint on g
 instance Functor (FFC g) where
-  fmap f = \mf -> FFC (\pur imp -> runFFC mf (pur . f) imp)
+  fmap f = \ma -> FFC (\imp -> fmap f (unFFC ma imp))
   {-# INLINE fmap #-}
 
 -- | Lift a pure value into the Freer monad
 fpure :: a -> FFC g a
-fpure = \a -> FFC (\pur _imp -> pur a)
+fpure = \a -> FFC (\imp -> pure a)
 {-# INLINE fpure #-}
 
 -- | Given an operation in @g@ and a continuation returning a monadic
 -- computation, sequence the continuation after the operation.
 fimpure :: g x -> (x -> FFC g a) -> FFC g a
-fimpure gx k = FFC (\pur imp -> imp gx (\x -> runFFC (k x) pur imp))
+fimpure gx k = FFC (\imp -> (imp gx) >>= \x -> unFFC (k x) imp)
 {-# INLINE fimpure #-}
 
 -- | Embed an operation of 'g' into the monad
@@ -50,22 +84,22 @@ fimpure gx k = FFC (\pur imp -> imp gx (\x -> runFFC (k x) pur imp))
 -- eta eff === fimpure eff fpure
 -- @
 eta :: g a -> FFC g a
-eta = \eff -> FFC (\pur imp -> imp eff pur)
+eta = \eff -> FFC (\imp -> imp eff)
 {-# INLINE eta #-}
 -- proof:
 --     eta eff
 -- === FFC (\pur imp -> imp eff pur)                                                 by defn
 -- === FFC (\pur imp -> imp eff (\x -> pur x))                                       by eta expansion
--- === FFC (\pur imp -> imp eff (\x -> runFFC (FFC (\pur' _ -> pur' x)) pur imp))    by defn & eta expansion
--- === FFC (\pur imp -> imp eff (\x -> runFFC (fpure x) pur imp))                    by defn
+-- === FFC (\pur imp -> imp eff (\x -> unFFC (FFC (\pur' _ -> pur' x)) pur imp))    by defn & eta expansion
+-- === FFC (\pur imp -> imp eff (\x -> unFFC (fpure x) pur imp))                    by defn
 -- === fimpure eff fpure                                                             by defn
 
 -- | It's an 'Applicative' without a constraint on g
 instance Applicative (FFC g) where
   pure = fpure
   {-# INLINE pure #-}
-  (<*>) = \mf mx -> FFC (\pur imp -> runFFC mf (\f -> runFFC mx (pur . f) imp) imp)
-          -- \mf mx -> runFFC mf (runFFC mx (\x f -> (fpure (f x)))
+  (<*>) = \mf mx -> FFC (\imp -> unFFC mf imp <*> unFFC mx imp)
+          -- \mf mx -> unFFC mf (unFFC mx (\x f -> (fpure (f x)))
           --                      (\gx k f -> fimpure gx (\x -> (k x f))))
           --          fimpure
   {-# INLINE (<*>) #-}
@@ -75,19 +109,19 @@ instance Applicative (FFC g) where
 instance Monad (FFC g) where
   return = fpure
   {-# INLINE return #-}
-  (>>=) = \mx f -> FFC (\pur imp -> runFFC mx (\x -> runFFC (f x) pur imp) imp)
-                   -- runFFC mx f fimpure
+  (>>=) = \mx f -> FFC (\imp -> unFFC mx imp >>= \x -> unFFC (f x) imp)
+                   -- unFFC mx f fimpure
   {-# INLINE (>>=) #-}
 
 -- | Lift a natural transformation in Hask to a natural transformation on the free monads.
 foist :: (forall x . f x -> g x) -> FFC f a -> FFC g a
-foist phi = \ma -> -- runFFC ma return (fimpure . phi)
-              FFC (\pur imp -> runFFC ma pur (imp . phi))
+foist phi = \ma -> -- unFFC ma return (fimpure . phi)
+              FFC (\imp -> unFFC ma (imp . phi))
 {-# INLINE foist #-}
 
 -- | If @m@ is a monad, we can interpret @FFC m@ in itself
 retractFFC :: Monad m => FFC m a -> m a
-retractFFC ma = runFFC ma return (>>=)
+retractFFC ma = runCont (unFFC ma (\mx -> cont (\f -> mx >>= f))) return
 {-# INLINE retractFFC #-}
 -- effects are interpreted as themselves:
 --
@@ -97,7 +131,7 @@ retractFFC ma = runFFC ma return (>>=)
 --
 -- @
 --     retractFFC (eff ma)
--- === runFFC (FFC (\pur imp -> imp ma pur) return (>>=))   by defns
+-- === unFFC (FFC (\pur imp -> imp ma pur) return (>>=))   by defns
 -- === (>>=) ma return                                      by beta
 -- === ma                                                   by right identity law
 -- @
@@ -109,7 +143,7 @@ retractFFC ma = runFFC ma return (>>=)
 -- @
 --
 -- @
---     runFFC (FFC (\pur _ -> pur a)) return (>>=)   by defns
+--     unFFC (FFC (\pur _ -> pur a)) return (>>=)   by defns
 -- === return a                                      by beta
 -- @
 --
@@ -118,13 +152,13 @@ retractFFC ma = runFFC ma return (>>=)
 -- @
 --
 -- @
---     retractFFC (FFC (\pur imp -> runFFC m (\x -> runFFC (f x) pur imp) imp))            by defn (>>=)
--- === runFFC (FFC (\pur imp -> runFFC m (\x -> runFFC (f x) pur imp) imp)) return (>>=)   by defn retractFFC
--- === runFFC m (\x -> runFFC (f x) return (>>=)) (>>=)                                    by beta
+--     retractFFC (FFC (\pur imp -> unFFC m (\x -> unFFC (f x) pur imp) imp))            by defn (>>=)
+-- === unFFC (FFC (\pur imp -> unFFC m (\x -> unFFC (f x) pur imp) imp)) return (>>=)   by defn retractFFC
+-- === unFFC m (\x -> unFFC (f x) return (>>=)) (>>=)                                    by beta
 -- ===
 -- === ???
 -- ===
--- === runFFC m return (>>=) >>= \x -> runFFC (f x) return (>>=)                           by defn retractFFC
+-- === unFFC m return (>>=) >>= \x -> unFFC (f x) return (>>=)                           by defn retractFFC
 --     retractFFC m >>= \x -> retractFFC (f x)
 -- @
 --
@@ -221,10 +255,10 @@ retractFFC ma = runFFC ma return (>>=)
 --
 -- @
 --     FFC (\\pur' _ -> pur' a) >>= f
--- === FFC (\\pur imp -> (\\pur' _ -> pur' a) (\\x -> runFFC (f x) pur imp) imp)   by defn
--- === FFC (\\pur imp -> (\\x -> runFFC (f x) pur imp) a)                         by beta
--- === FFC (\\pur imp -> runFFC (f a) pur imp)                                   by beta
--- === FFC (runFFC (f a))                                                       by eta
+-- === FFC (\\pur imp -> (\\pur' _ -> pur' a) (\\x -> unFFC (f x) pur imp) imp)   by defn
+-- === FFC (\\pur imp -> (\\x -> unFFC (f x) pur imp) a)                         by beta
+-- === FFC (\\pur imp -> unFFC (f a) pur imp)                                   by beta
+-- === FFC (unFFC (f a))                                                       by eta
 -- === f a                                                                      by eta
 -- @
 --
@@ -237,8 +271,8 @@ retractFFC ma = runFFC ma return (>>=)
 -- 
 -- @
 --     FFC mp >>= (\\x -> FFC (\\pur' _ -> pur' x))                                            by defn
--- === FFC (\\pur imp -> mp (\\a -> runFFC ((\\x -> FFC (\\pur' _ -> pur' x)) a) pur imp) imp)   by defn
--- === FFC (\\pur imp -> mp (\\a -> runFFC (FFC (\\pur' _ -> pur' a)) pur imp) imp)             by beta
+-- === FFC (\\pur imp -> mp (\\a -> unFFC ((\\x -> FFC (\\pur' _ -> pur' x)) a) pur imp) imp)   by defn
+-- === FFC (\\pur imp -> mp (\\a -> unFFC (FFC (\\pur' _ -> pur' a)) pur imp) imp)             by beta
 -- === FFC (\\pur imp -> mp (\\a -> pur a) imp)                                                by beta
 -- === FFC (\\pur imp -> mp pur imp)                                                          by eta
 -- === FFC mp                                                                                by eta
@@ -252,11 +286,11 @@ retractFFC ma = runFFC ma return (>>=)
 -- @
 --
 -- @
---     FFC (\\pur imp -> runFFC (FFC mp >>= f) (\\a -> runFFC (g a) pur imp) imp)                                                 by defn (>>=) outer
--- === FFC (\\pur imp -> runFFC (FFC (\\pur' imp' -> mp (\\b -> runFFC (f b) pur' imp') imp')) (\\a -> runFFC (g a) pur imp) imp)   by defn (>>= inner)
--- === FFC (\\pur imp -> mp (\\b -> runFFC (f b) (\\a -> runFFC (g a) pur imp)) imp)                                               by beta
--- === FFC (\\pur imp -> mp (\\b -> runFFC (FFC (\\pur' imp' -> runFFC (f b) (\\a -> runFFC (g a) pur' imp') imp')) pur imp) imp)   by beta
--- === FFC (\\pur imp -> mp (\\b -> runFFC (f b >>= g) pur imp) imp)                                                              by defn
--- === FFC (\\pur imp -> mp (\\b -> runFFC ((\\z -> f z >>= g) b) pur imp) imp)                                                    by beta
+--     FFC (\\pur imp -> unFFC (FFC mp >>= f) (\\a -> unFFC (g a) pur imp) imp)                                                 by defn (>>=) outer
+-- === FFC (\\pur imp -> unFFC (FFC (\\pur' imp' -> mp (\\b -> unFFC (f b) pur' imp') imp')) (\\a -> unFFC (g a) pur imp) imp)   by defn (>>= inner)
+-- === FFC (\\pur imp -> mp (\\b -> unFFC (f b) (\\a -> unFFC (g a) pur imp)) imp)                                               by beta
+-- === FFC (\\pur imp -> mp (\\b -> unFFC (FFC (\\pur' imp' -> unFFC (f b) (\\a -> unFFC (g a) pur' imp') imp')) pur imp) imp)   by beta
+-- === FFC (\\pur imp -> mp (\\b -> unFFC (f b >>= g) pur imp) imp)                                                              by defn
+-- === FFC (\\pur imp -> mp (\\b -> unFFC ((\\z -> f z >>= g) b) pur imp) imp)                                                    by beta
 -- === FFC mp >>= (\\z -> f z >>= g)                                                                                             by defn
 -- @

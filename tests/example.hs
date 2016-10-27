@@ -24,7 +24,10 @@ instance Functor Empty where
 
 -- | The freer monad of the empty 'Functor' is the 'Identity' monad
 interpEmpty :: FFC Empty a -> Identity a
-interpEmpty (FFC ra) = ra return (\emp k -> k (vacuous emp))
+interpEmpty = retractFFC . foist phi
+  where
+    phi :: Empty x -> Identity x
+    phi emp = vacuous emp
 
 f :: Monad m => Int -> m Int
 f 0 = return 1
@@ -40,18 +43,35 @@ instance Functor (Const b) where
   fmap _f (Const b) = Const b
 
 interpConst :: FFC (Const b) a -> Either b a
-interpConst (FFC p) = p Right (\(Const b) _k -> Left b) 
+interpConst = retractFFC . foist phi
+  where
+    phi :: Const b x -> Either b x
+    phi (Const b) = Left b
 
 raiseConst :: b -> FFC (Const b) a
 raiseConst b = eta (Const b)
 
 data Cont a = Cont { runCont :: forall r . (a -> r) -> r }
 
+instance Functor Cont where
+  fmap f (Cont c) = Cont (\k -> c (k . f))
+
+instance Applicative Cont where
+  pure = retCont
+  mf <*> mx = mf >>= \f -> mx >>= (return . f)
+
+instance Monad Cont where
+  return = retCont
+  (Cont cx) >>= f = Cont (\k -> cx (\x -> runCont (f x) k))
+
 retCont :: a -> Cont a
 retCont a = Cont (\k -> k a)
 
 interpretIdentity :: FFC Identity a -> Cont a
-interpretIdentity (FFC p) = p retCont (\(Identity x) k -> k x)
+interpretIdentity = retractFFC . foist phi
+  where
+    phi :: Identity x -> Cont x
+    phi (Identity x) = retCont x
 
 contCont :: (forall r . (a -> r) -> r) -> FFC Identity a
 contCont k = eta (k Identity)
